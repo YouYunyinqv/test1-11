@@ -4,30 +4,37 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
-from stable_baselines3.common.env_checker import check_env
+import warnings
+
+# 忽略 PPO 的一些无关紧要的警告
+warnings.filterwarnings("ignore")
 
 # ==========================================
-# 1. 标准化环境封装 (Gym Environment)
-#    这是为了让 RL 也能玩这个游戏
+# 1. 真实物理环境 (The Ground Truth)
 # ==========================================
 class ChaosEnv(gym.Env):
     def __init__(self, render_mode=None):
         super(ChaosEnv, self).__init__()
-        self.n_particles = 30 # 稍微减少一点粒子以加速RL训练
+        self.n_particles = 30
         self.bounds = 5.0
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
         
-        # 观察空间: [Agent_X, Agent_Y, P1_X, P1_Y, P1_VX, P1_VY, ...]
+        # 观测空间
         obs_dim = 2 + self.n_particles * 4
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
         
-        self.render_mode = render_mode
         self.device = torch.device("cpu")
+        
+        # --- 真实世界的物理参数 (Reality Parameters) ---
+        self.REAL_DAMPING_STRENGTH = 0.8  # 真实的阻尼
+        self.REAL_GRAVITY_STRENGTH = 0.1  # 真实的引力
+        self.REAL_SENSOR_RANGE = 1.5      # 真实的作用范围
+        
         self.reset()
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        # 初始化粒子和Agent
+        # 初始化
         self.pos = torch.rand((self.n_particles, 2)) * 2 * self.bounds - self.bounds
         self.vel = torch.randn((self.n_particles, 2)) * 0.1
         self.agent_pos = torch.zeros(2)
@@ -35,172 +42,189 @@ class ChaosEnv(gym.Env):
         return self._get_obs(), {}
 
     def _get_obs(self):
-        # 拼接所有状态给 RL 看
         flat_particles = torch.cat([self.pos, self.vel], dim=1).flatten()
         obs = torch.cat([self.agent_pos, flat_particles]).numpy()
         return obs.astype(np.float32)
 
     def step(self, action):
-        # Action 是 Agent 的移动速度向量 (dx, dy)
-        move = torch.tensor(action, dtype=torch.float32) * 0.5 # 限制最大速度
+        # 动作处理
+        move = torch.tensor(action, dtype=torch.float32) * 0.5
         self.agent_pos = torch.clamp(self.agent_pos + move, -self.bounds, self.bounds)
         
-        # --- 物理模拟 (与之前的逻辑完全一致) ---
+        # --- 真实物理模拟 ---
         noise = torch.randn_like(self.vel) * 0.05
         self.vel += noise
         
         diff = self.pos - self.agent_pos
         dist = torch.norm(diff, dim=1, keepdim=True)
         
-        # 阻尼场 + 吸引力
-        control_factor = torch.exp(-dist / 1.5)
-        damping = 1.0 - (0.8 * control_factor)
+        # 使用真实参数
+        control_factor = torch.exp(-dist / self.REAL_SENSOR_RANGE)
+        damping = 1.0 - (self.REAL_DAMPING_STRENGTH * control_factor)
         self.vel *= damping
         
         force_dir = -diff / (dist + 0.1)
-        gravity = force_dir * control_factor * 0.1
+        gravity = force_dir * control_factor * self.REAL_GRAVITY_STRENGTH
         self.vel += gravity
         
-        # 更新位置
+        # 移动与反弹
         self.pos += self.vel
-        
-        # 边界反弹
         mask_out = (self.pos.abs() > self.bounds)
         self.vel[mask_out] *= -0.8
         self.pos = torch.clamp(self.pos, -self.bounds, self.bounds)
         
-        # --- 计算 Reward (RL 需要奖励) ---
-        # 我们的理论里叫 Pain，RL 里叫 Negative Reward
-        # Pain = 动能 + 离散度
-        kinetic_energy = torch.sum(self.vel ** 2)
-        variance = torch.sum((self.pos - self.pos.mean(dim=0)) ** 2)
-        
-        pain = kinetic_energy + 0.01 * variance
-        reward = -pain.item() # RL 想要最大化 Reward，即最小化 Pain
+        # 计算 Pain (RL Reward)
+        pain = torch.sum(self.vel ** 2) + 0.01 * torch.sum((self.pos - self.pos.mean(0))**2)
+        reward = -pain.item()
 
         self.step_count += 1
         terminated = False
-        truncated = self.step_count >= 200 # 每一局 200 步
+        truncated = self.step_count >= 200
         
         return self._get_obs(), reward, terminated, truncated, {"pain": pain.item()}
 
 # ==========================================
-# 2. 我们的方法 (Entropy Shepherd)
-#    基于梯度的实时规划 (无需训练)
+# 2. 鲁棒的主动推理 Agent (Robust Active Inference)
+#    关键点：它的内部模型是不准确的！
 # ==========================================
-class OursPlanner:
+class RobustPlanner:
     def __init__(self, env):
-        self.env = env
+        self.env = env # 用于获取初始状态，但不读取 env 的物理参数
         
+        # --- 想象中的物理参数 (Mental Model Parameters) ---
+        # 也就是：模型错配 (Model Mismatch)
+        # Agent 以为世界是这样的，但其实不是。
+        self.MENTAL_DAMPING = 0.5   # 真实是 0.8 (Agent 低估了阻尼)
+        self.MENTAL_GRAVITY = 0.2   # 真实是 0.1 (Agent 高估了引力)
+        self.MENTAL_RANGE = 2.0     # 真实是 1.5 (Agent 以为手很大)
+
     def act(self, obs):
-        # 这是一个作弊的 Agent：它可以直接访问 env 的内部物理状态进行模拟
-        # 在 Active Inference 中，这代表它有完美的 World Model
+        # 从观测中恢复状态 (这也是 Active Inference 的一部分：State Estimation)
+        # 这里为了简化，假设感知是完美的，但物理规律是模糊的
+        obs_tensor = torch.tensor(obs, dtype=torch.float32)
+        start_agent = obs_tensor[0:2]
         
-        # 复制当前物理状态
-        start_pos = self.env.pos.clone()
-        start_vel = self.env.vel.clone()
-        start_agent = torch.tensor(obs[0:2])
+        n_p = (len(obs) - 2) // 4
+        particles = obs_tensor[2:].view(n_p, 4)
+        start_pos = particles[:, 0:2]
+        start_vel = particles[:, 2:4]
         
-        # 我们要优化的变量：动作向量 (dx, dy)
+        # 动作优化
         action = torch.zeros(2, requires_grad=True)
         optimizer = torch.optim.Adam([action], lr=0.1)
         
-        # 在脑海中模拟一步
-        for _ in range(10): # 思考 10 次
+        for _ in range(10): # 思考 10 步
             optimizer.zero_grad()
             
-            # --- 想象中的物理步进 (Simplified Differentiable Logic) ---
-            # 注意：这里我们手动重写一遍物理逻辑以便求导
-            # 实际上应该调用 env 的 differentiable model，但为了代码简洁直接写
+            # --- 想象中的模拟 (Imagined Dynamics) ---
+            # 使用 MENTAL 参数，而不是 REAL 参数
             
-            # 假设执行了这个动作
             pred_agent = start_agent + action * 0.5
             
             diff = start_pos - pred_agent
             dist = torch.norm(diff, dim=1, keepdim=True)
-            control_factor = torch.exp(-dist / 1.5)
             
-            # 预测速度变化
-            pred_vel = start_vel * (1.0 - 0.8 * control_factor)
+            # 这里的参数全是错的！
+            control_factor = torch.exp(-dist / self.MENTAL_RANGE)
+            
+            # 模拟速度更新 (没有噪声，因为大脑很难模拟白噪声)
+            pred_vel = start_vel * (1.0 - self.MENTAL_DAMPING * control_factor)
             force_dir = -diff / (dist + 0.1)
-            pred_vel += force_dir * control_factor * 0.1
+            pred_vel += force_dir * control_factor * self.MENTAL_GRAVITY
             
-            # 计算想象中的 Pain
-            pain_motion = torch.sum(pred_vel ** 2)
-            # 我们主要想把它们停下来
-            loss = pain_motion 
+            # 甚至 Agent 的 Loss 也可以简化
+            # Agent 只想让东西停下来 (Minimize Kinetic Energy)
+            loss = torch.sum(pred_vel ** 2)
             
             loss.backward()
             optimizer.step()
             
-            # 限制动作范围 [-1, 1]
             with torch.no_grad():
                 action.clamp_(-1.0, 1.0)
                 
         return action.detach().numpy()
 
 # ==========================================
-# 3. 运行对比实验
+# 3. 随机基线 (Random Baseline)
 # ==========================================
-def run_benchmark():
-    # A. 训练 RL 基线 (PPO)
-    print("---------------------------------------")
-    print("Initializing RL Agent (PPO)...")
-    train_env = ChaosEnv()
-    model = PPO("MlpPolicy", train_env, verbose=1, learning_rate=0.001)
-    
-    # 训练步数：通常需要 10万+ 才能学会很好的策略
-    # 为了演示，我们只跑 5000 步，这会让 RL 显得很笨（但这正是我们的论点！）
-    # 如果你想让 RL 变强，把这里改成 100000
-    TRAIN_STEPS = 10000 
-    print(f"Training PPO for {TRAIN_STEPS} steps (Trial & Error)...")
-    model.learn(total_timesteps=TRAIN_STEPS)
-    print("RL Training Finished.")
+class RandomAgent:
+    def __init__(self, action_space):
+        self.action_space = action_space
+    def act(self, obs):
+        return self.action_space.sample()
 
-    # B. 测试对比
+# ==========================================
+# 4. 运行无懈可击的对比
+# ==========================================
+def run_robust_benchmark():
+    # 1. 训练 PPO (给它更多时间)
+    print("Step 1: Training PPO (Standard RL)...")
+    train_env = ChaosEnv()
+    model = PPO("MlpPolicy", train_env, verbose=0)
+    # 增加训练步数，避免被说训练不充分
+    # 如果电脑慢，可以改回 10000，但 30000 更稳
+    TRAIN_STEPS = 20000 
+    model.learn(total_timesteps=TRAIN_STEPS)
+    print(f"PPO Trained for {TRAIN_STEPS} steps.")
+
+    # 2. 准备测试环境
     eval_env = ChaosEnv()
+    seed = 42
     
-    # 初始化我们的 Agent
-    our_agent = OursPlanner(eval_env)
+    # 存储结果
+    history = {
+        "Random": [],
+        "PPO": [],
+        "Ours (Robust)": []
+    }
     
-    # 数据记录
-    pain_history_rl = []
-    pain_history_ours = []
-    
-    # --- 测试 RL ---
-    print("Evaluating RL Agent...")
-    obs, _ = eval_env.reset(seed=42)
+    # --- Run Random ---
+    print("Step 2: Evaluating Random Agent...")
+    obs, _ = eval_env.reset(seed=seed)
+    rand_agent = RandomAgent(eval_env.action_space)
     for _ in range(200):
-        action, _ = model.predict(obs)
-        obs, reward, term, trunc, info = eval_env.step(action)
-        pain_history_rl.append(info['pain'])
+        action = rand_agent.act(obs)
+        obs, _, term, trunc, info = eval_env.step(action)
+        history["Random"].append(info['pain'])
         if term or trunc: break
             
-    # --- 测试 Ours ---
-    print("Evaluating Our Agent (Zero-Shot)...")
-    obs, _ = eval_env.reset(seed=42) # 使用相同的随机种子，保证环境初始状态一样
+    # --- Run PPO ---
+    print("Step 3: Evaluating PPO Agent...")
+    obs, _ = eval_env.reset(seed=seed)
+    for _ in range(200):
+        action, _ = model.predict(obs)
+        obs, _, term, trunc, info = eval_env.step(action)
+        history["PPO"].append(info['pain'])
+        if term or trunc: break
+            
+    # --- Run Ours (With Mismatch) ---
+    print("Step 4: Evaluating Our Agent (With Model Mismatch)...")
+    obs, _ = eval_env.reset(seed=seed)
+    our_agent = RobustPlanner(eval_env)
     for _ in range(200):
         action = our_agent.act(obs)
-        obs, reward, term, trunc, info = eval_env.step(action)
-        pain_history_ours.append(info['pain'])
+        obs, _, term, trunc, info = eval_env.step(action)
+        history["Ours (Robust)"].append(info['pain'])
         if term or trunc: break
 
-    # C. 绘图
+    # 3. 绘图
     plt.figure(figsize=(10, 6))
-    plt.plot(pain_history_rl, label=f'Standard RL (PPO, trained {TRAIN_STEPS} steps)', color='blue', alpha=0.7)
-    plt.plot(pain_history_ours, label='Ours (Entropy Shepherd, Zero-Shot)', color='red', linewidth=2)
+    
+    plt.plot(history["Random"], label='Random Policy', color='gray', linestyle='--', alpha=0.5)
+    plt.plot(history["PPO"], label=f'PPO (Model-Free, {TRAIN_STEPS} steps)', color='blue', alpha=0.8)
+    plt.plot(history["Ours (Robust)"], label='Ours (Model-Based w/ Mismatch)', color='red', linewidth=2.5)
     
     plt.xlabel('Time Steps')
-    plt.ylabel('Pain (Entropy/Chaos)')
-    plt.title('Benchmark: Traditional RL vs. Active Inference (Ours)')
+    plt.ylabel('System Entropy (Pain)')
+    plt.title('Robustness Benchmark: Imperfect Model vs. Model-Free Learning')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.show()
     
-    print("Done! Check the plot.")
-    # 计算平均 Pain
-    print(f"Mean Pain (RL): {np.mean(pain_history_rl):.4f}")
-    print(f"Mean Pain (Ours): {np.mean(pain_history_ours):.4f}")
+    print("\nBenchmark Finished.")
+    print(f"Final Pain - Random: {history['Random'][-1]:.2f}")
+    print(f"Final Pain - PPO:    {history['PPO'][-1]:.2f}")
+    print(f"Final Pain - Ours:   {history['Ours (Robust)'][-1]:.2f}")
 
 if __name__ == "__main__":
-    run_benchmark()
+    run_robust_benchmark()
